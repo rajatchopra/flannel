@@ -12,6 +12,7 @@ import (
 	"github.com/coreos/flannel/backend/hostgw"
 	"github.com/coreos/flannel/backend/udp"
 	"github.com/coreos/flannel/backend/vxlan"
+	"github.com/coreos/flannel/backend/ovs"
 	"github.com/coreos/flannel/subnet"
 )
 
