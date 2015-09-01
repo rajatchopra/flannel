@@ -42,6 +42,8 @@ type OVSNetwork struct {
 	VNI  int
 	leases  []*subnet.Lease
 	config  *subnet.Config
+	leaseRenewMap map[string]bool
+	mut sync.Mutex
 }
 
 type OVSBackend struct {
@@ -53,7 +55,7 @@ type OVSBackend struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	mut    sync.Mutex
-	runonce sync.Once
+	networkWatchMap map[string]bool
 }
 
 func New(sm subnet.Manager, network string, config *subnet.Config) backend.Backend {
@@ -64,6 +66,7 @@ func New(sm subnet.Manager, network string, config *subnet.Config) backend.Backe
 			networks: make([]*OVSNetwork,0),
 			ctx:     ctx,
 			cancel:  cancel,
+			networkWatchMap: make(map[string]bool, 0),
 		}
 	}
 	once.Do(onceFunc)
@@ -105,6 +108,7 @@ func (ovsb *OVSBackend) AddNetwork(network string, config *subnet.Config) (*OVSN
 		config: config,
 		VNI: parseVNI(config),
 		leases: make([]*subnet.Lease, 0),
+		leaseRenewMap: make(map[string]bool, 0),
 	}
 	ovsb.networks = append(ovsBackend.networks, n)
 	return n
@@ -159,29 +163,41 @@ func (ovsb *OVSBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr 
 }
 
 func (ovsb *OVSBackend) Run() {
-	onceFunc := func() {
-		for _, network := range(ovsb.networks) {
-			for _, lease := range(network.leases) {
-				ovsb.wg.Add(1)
-				go func() {
-					subnet.LeaseRenewer(ovsb.ctx, ovsb.sm, network.Name, lease)
-					log.Info("LeaseRenewer exited")
-					ovsb.wg.Done()
-				}()
-			} // end for: each lease in a network
-		} // end for: each network being watched in this backend instance
-		defer ovsb.wg.Wait()
+	ovsb.mut.Lock()
 
-		log.Info("Watching for new subnet leases")
-		for _, network := range(ovsb.networks) {
+	
+	for _, network := range(ovsb.networks) {
+		for _, lease := range(network.leases) {
+			if _, ok := network.leaseRenewMap[lease.Subnet.String()]; ok {
+				continue
+			}
 			ovsb.wg.Add(1)
-			go ovsb.watchNetworkLeases(network)
+			go func() {
+				network.leaseRenewMap[lease.Subnet.String()] = true
+				subnet.LeaseRenewer(ovsb.ctx, ovsb.sm, network.Name, lease)
+				delete(network.leaseRenewMap, lease.Subnet.String())
+				log.Info("LeaseRenewer exited")
+				ovsb.wg.Done()
+			}()
+		} // end for: each lease in a network
+	} // end for: each network being watched in this backend instance
+	defer ovsb.wg.Wait()
+
+	log.Info("Watching for new subnet leases")
+	for _, network := range(ovsb.networks) {
+		if _, ok := ovsb.networkWatchMap[network.Name]; ok {
+			continue
 		}
+		ovsb.wg.Add(1)
+		go ovsb.watchNetworkLeases(network)
 	}
-	ovsb.runonce.Do(onceFunc)
+
+	ovsb.mut.Unlock()
 }
 
 func (ovsb *OVSBackend) watchNetworkLeases(network *OVSNetwork) {
+	ovsb.networkWatchMap[network.Name] = true
+
 	evts := make(chan []subnet.Event)
 	ovsb.wg.Add(1)
 	go func() {
