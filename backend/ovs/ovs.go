@@ -52,6 +52,8 @@ type OVSBackend struct {
 	extIAddr net.IP
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+	mut    sync.Mutex
+	runonce sync.Once
 }
 
 func New(sm subnet.Manager, network string, config *subnet.Config) backend.Backend {
@@ -108,26 +110,29 @@ func (ovsb *OVSBackend) AddNetwork(network string, config *subnet.Config) (*OVSN
 	return n
 }
 
-func (ovsb *OVSBackend) AddLeaseToNetwork(network *OVSNetwork) error {
+func (ovsb *OVSBackend) AddLeaseToNetwork(network *OVSNetwork) (*subnet.Lease, error) {
 	// Acquire a lease for this node within the given network
 	sa, err := newSubnetAttrs(ovsb.extIAddr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	l, err := ovsb.sm.AcquireLease(ovsb.ctx, network.Name, sa)
 	switch err {
 	case nil:
 		network.leases = append(network.leases, l)
 	case context.Canceled, context.DeadlineExceeded:
-		return err
+		return nil, err
 	default:
-		return fmt.Errorf("failed to acquire lease: %v", err)
+		return nil, fmt.Errorf("failed to acquire lease: %v", err)
 	}
 
-	return nil
+	return l, nil
 }
 
 func (ovsb *OVSBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (*backend.SubnetDef, error) {
+	ovsb.mut.Lock()
+	defer ovsb.mut.Unlock()
+
 	// store the ext addresses
 	ovsb.extIAddr = extIaddr
 
@@ -141,9 +146,9 @@ func (ovsb *OVSBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr 
 
 	for _, network := range ovsb.networks {
 		if len(network.leases) == 0 {
-			err := ovsb.AddLeaseToNetwork(network)
+			l, err := ovsb.AddLeaseToNetwork(network)
 			// Configure the device for the newly acquired lease
-			ovsb.dev.ConfigureDeviceForNetwork(network)
+			ovsb.dev.ConfigureDeviceForNetwork(network, l)
 			if err != nil {
 				return nil, err
 			}
@@ -154,23 +159,26 @@ func (ovsb *OVSBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr 
 }
 
 func (ovsb *OVSBackend) Run() {
-	for _, network := range(ovsb.networks) {
-		for _, lease := range(network.leases) {
-			ovsb.wg.Add(1)
-			go func() {
-				subnet.LeaseRenewer(ovsb.ctx, ovsb.sm, network.Name, lease)
-				log.Info("LeaseRenewer exited")
-				ovsb.wg.Done()
-			}()
-		} // end for: each lease in a network
-	} // end for: each network being watched in this backend instance
-	defer ovsb.wg.Wait()
+	onceFunc := func() {
+		for _, network := range(ovsb.networks) {
+			for _, lease := range(network.leases) {
+				ovsb.wg.Add(1)
+				go func() {
+					subnet.LeaseRenewer(ovsb.ctx, ovsb.sm, network.Name, lease)
+					log.Info("LeaseRenewer exited")
+					ovsb.wg.Done()
+				}()
+			} // end for: each lease in a network
+		} // end for: each network being watched in this backend instance
+		defer ovsb.wg.Wait()
 
-	log.Info("Watching for new subnet leases")
-	for _, network := range(ovsb.networks) {
-		ovsb.wg.Add(1)
-		go ovsb.watchNetworkLeases(network)
+		log.Info("Watching for new subnet leases")
+		for _, network := range(ovsb.networks) {
+			ovsb.wg.Add(1)
+			go ovsb.watchNetworkLeases(network)
+		}
 	}
+	ovsb.runonce.Do(onceFunc)
 }
 
 func (ovsb *OVSBackend) watchNetworkLeases(network *OVSNetwork) {
@@ -181,6 +189,10 @@ func (ovsb *OVSBackend) watchNetworkLeases(network *OVSNetwork) {
 		log.Info("WatchLeases exited")
 		ovsb.wg.Done()
 	}()
+
+	log.Errorf("rcrcrc - watching %v\n", network)
+	initialEvtsBatch := <-evts
+	ovsb.handleSubnetEvents(network, initialEvtsBatch)
 
 	for {
 		select {
