@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"encoding/hex"
 
+	"github.com/coreos/flannel/subnet"
 	log "github.com/coreos/flannel/Godeps/_workspace/src/github.com/golang/glog"
 )
 
@@ -82,9 +83,9 @@ func generateDefaultGateway(sna *net.IPNet) net.IP {
 	return net.IPv4(ip[0], ip[1], ip[2], ip[3]|0x1)
 }
 
-func (dev *ovsDevice) ConfigureDeviceForNetwork(network *OVSNetwork) {
+func (dev *ovsDevice) ConfigureDeviceForNetwork(network *OVSNetwork, l *subnet.Lease) {
 	tunDevName := fmt.Sprintf("tun%s", network.Name)
-	subnet := network.leases[0].Subnet.ToIPNet()
+	subnet := l.Subnet.ToIPNet()
 	tunGateway := generateDefaultGateway(subnet)
 
 	// add a tunnel device for this network
@@ -93,9 +94,12 @@ func (dev *ovsDevice) ConfigureDeviceForNetwork(network *OVSNetwork) {
         // setup tun address
 	exec.Command("ip", "addr", "add", tunGateway.String(), "dev", tunDevName).CombinedOutput()
 	exec.Command("ip", "link", "set", tunDevName, "up").CombinedOutput()
-	
+
 	newTunPort := &ovsTunnelDevice{name: tunDevName, portId: 2, subnet: subnet}
 	dev.tunnelPortMap[network.Name] = newTunPort
+
+	dev.AddRoutes(network, subnet)
+	
 }
 
 func (dev *ovsDevice) AddRemoteSubnet(network *OVSNetwork, lease *net.IPNet, vtep net.IP) error {
