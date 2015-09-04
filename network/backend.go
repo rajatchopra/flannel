@@ -25,6 +25,7 @@ var backendMap = map[string]beNewFunc {
 	"vxlan":   vxlan.New,
 	"aws-vpc": awsvpc.New,
 	"gce":     gce.New,
+	"ovs":	   ovs.New,
 }
 
 func newBackend(sm subnet.Manager, backendType string, extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (backend.Backend, error) {
