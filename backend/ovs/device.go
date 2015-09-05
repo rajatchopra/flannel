@@ -102,6 +102,10 @@ func (dev *ovsDevice) ConfigureDeviceForNetwork(network *OVSNetwork, l *subnet.L
 	
 }
 
+func (dev *ovsDevice) AddLocalSubnet(network *OVSNetwork, lease *net.IPNet) error {
+	return nil
+}
+
 func (dev *ovsDevice) AddRemoteSubnet(network *OVSNetwork, lease *net.IPNet, vtep net.IP) error {
 	cookie := generateCookie(vtep.String())
 	iprule := fmt.Sprintf("table=6,cookie=0x%s,priority=100,ip,nw_dst=%s,actions=move:NXM_NX_REG0[]->NXM_NX_TUN_ID[0..31],set_field:%s->tun_dst,output:1", cookie, lease.String(), vtep.String())
@@ -117,6 +121,10 @@ func (dev *ovsDevice) AddRemoteSubnet(network *OVSNetwork, lease *net.IPNet, vte
 		return err
 	}
 	return dev.AddRoutes(network, lease)
+}
+
+func (dev *ovsDevice) RemoveLocalSubnet(network *OVSNetwork, lease *net.IPNet) error {
+	return nil
 }
 
 func (dev *ovsDevice) RemoveRemoteSubnet(network *OVSNetwork, lease *net.IPNet, vtep net.IP) error {

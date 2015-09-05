@@ -198,7 +198,7 @@ func (ovsb *OVSBackend) watchNetworkLeases(network *OVSNetwork) {
 	evts := make(chan []subnet.Event)
 	ovsb.wg.Add(1)
 	go func() {
-		subnet.WatchLeases(ovsb.ctx, ovsb.sm, network.Name, network.leases[0], evts)
+		subnet.WatchLeases(ovsb.ctx, ovsb.sm, network.Name, nil, evts)
 		log.Info("WatchLeases exited")
 		ovsb.wg.Done()
 	}()
@@ -239,7 +239,11 @@ func (ovsb *OVSBackend) handleSubnetEvents(network *OVSNetwork, batch []subnet.E
 			}
 
 			fmt.Printf("rcrc - network: %v\n", network)
-			ovsb.dev.AddRemoteSubnet(network, evt.Lease.Subnet.ToIPNet(), evt.Lease.Attrs.PublicIP.ToIP())
+			if ovsb.extIAddr.String() == evt.Lease.Attrs.PublicIP.String() {
+				ovsb.dev.AddLocalSubnet(network, evt.Lease.Subnet.ToIPNet())
+			} else {
+				ovsb.dev.AddRemoteSubnet(network, evt.Lease.Subnet.ToIPNet())
+			}
 
 		case subnet.EventRemoved:
 			log.Info("Subnet removed: ", evt.Lease.Subnet)
@@ -249,7 +253,11 @@ func (ovsb *OVSBackend) handleSubnetEvents(network *OVSNetwork, batch []subnet.E
 				continue
 			}
 
-			ovsb.dev.RemoveRemoteSubnet(network, evt.Lease.Subnet.ToIPNet(), evt.Lease.Attrs.PublicIP.ToIP())
+			if ovsb.extIAddr.String() == evt.Lease.Attrs.PublicIP.String() {
+				ovsb.dev.RemoveLocalSubnet(network, evt.Lease.Subnet.ToIPNet(), evt.Lease.Attrs.PublicIP.ToIP())
+			} else {
+				ovsb.dev.RemoveRemoteSubnet(network, evt.Lease.Subnet.ToIPNet(), evt.Lease.Attrs.PublicIP.ToIP())
+			}
 
 		default:
 			log.Error("Internal error: unknown event type: ", int(evt.Type))
