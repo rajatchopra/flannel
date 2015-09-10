@@ -242,7 +242,7 @@ func (ovsb *OVSBackend) handleSubnetEvents(network *OVSNetwork, batch []subnet.E
 			if ovsb.extIAddr.String() == evt.Lease.Attrs.PublicIP.String() {
 				ovsb.dev.AddLocalSubnet(network, evt.Lease.Subnet.ToIPNet())
 			} else {
-				ovsb.dev.AddRemoteSubnet(network, evt.Lease.Subnet.ToIPNet())
+				ovsb.dev.AddRemoteSubnet(network, evt.Lease.Subnet.ToIPNet(), evt.Lease.Attrs.PublicIP.ToIP())
 			}
 
 		case subnet.EventRemoved:
@@ -254,7 +254,7 @@ func (ovsb *OVSBackend) handleSubnetEvents(network *OVSNetwork, batch []subnet.E
 			}
 
 			if ovsb.extIAddr.String() == evt.Lease.Attrs.PublicIP.String() {
-				ovsb.dev.RemoveLocalSubnet(network, evt.Lease.Subnet.ToIPNet(), evt.Lease.Attrs.PublicIP.ToIP())
+				ovsb.dev.RemoveLocalSubnet(network, evt.Lease.Subnet.ToIPNet())
 			} else {
 				ovsb.dev.RemoveRemoteSubnet(network, evt.Lease.Subnet.ToIPNet(), evt.Lease.Attrs.PublicIP.ToIP())
 			}
