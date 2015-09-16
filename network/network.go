@@ -26,29 +26,36 @@ import (
 )
 
 type Network struct {
-	Name   string
-	Config *subnet.Config
+	Name       string
+	Config     *subnet.Config
+	ctx        context.Context
+	cancelFunc context.CancelFunc
 
 	sm     subnet.Manager
 	ipMasq bool
 	be     backend.Backend
+	lease  *subnet.Lease
 }
 
-func New(sm subnet.Manager, name string, ipMasq bool) *Network {
+func NewNetwork(ctx context.Context, sm subnet.Manager, name string, ipMasq bool) *Network {
+	ctx, cancel := context.WithCancel(ctx)
+
 	return &Network{
-		Name:   name,
-		sm:     sm,
-		ipMasq: ipMasq,
+		Name:       name,
+		ctx:        ctx,
+		cancelFunc: cancel,
+		sm:         sm,
+		ipMasq:     ipMasq,
 	}
 }
 
-func (n *Network) Init(ctx context.Context, iface *net.Interface, iaddr net.IP, eaddr net.IP) *backend.SubnetDef {
+func (n *Network) Init(iface *net.Interface, iaddr net.IP, eaddr net.IP) *backend.SubnetDef {
 	var be backend.Backend
 	var sn *backend.SubnetDef
 
 	steps := []func() error{
 		func() (err error) {
-			n.Config, err = n.sm.GetNetworkConfig(ctx, n.Name)
+			n.Config, err = n.sm.GetNetworkConfig(n.ctx, n.Name)
 			if err != nil {
 				log.Error("Failed to retrieve network config: ", err)
 			}
@@ -56,9 +63,9 @@ func (n *Network) Init(ctx context.Context, iface *net.Interface, iaddr net.IP, 
 		},
 
 		func() (err error) {
-			be, err = newBackend(n.sm, n.Name, n.Config)
+			be, err = newBackend(n.sm, n.Config.BackendType, iface, iaddr, eaddr)
 			if err != nil {
-				log.Error("Failed to create backend: ", err)
+				log.Errorf("Failed to create and initialize network %v (type %v): %v", n.Name, n.Config.BackendType, err)
 			} else {
 				n.be = be
 			}
@@ -66,9 +73,11 @@ func (n *Network) Init(ctx context.Context, iface *net.Interface, iaddr net.IP, 
 		},
 
 		func() (err error) {
-			sn, err = be.Init(iface, iaddr, eaddr)
+			sn, err = be.RegisterNetwork(n.ctx, n.Name, n.Config)
 			if err != nil {
-				log.Errorf("Failed to initialize network %v (type %v): %v", n.Name, be.Name(), err)
+				log.Errorf("Failed register network %v (type %v): %v", n.Name, n.Config.BackendType, err)
+			} else {
+				n.lease = sn.Lease
 			}
 			return
 		},
@@ -87,7 +96,7 @@ func (n *Network) Init(ctx context.Context, iface *net.Interface, iaddr net.IP, 
 	for _, s := range steps {
 		for ; ; time.Sleep(time.Second) {
 			select {
-			case <-ctx.Done():
+			case <-n.ctx.Done():
 				return nil
 			default:
 			}
@@ -102,16 +111,24 @@ func (n *Network) Init(ctx context.Context, iface *net.Interface, iaddr net.IP, 
 	return sn
 }
 
-func (n *Network) Run(ctx context.Context) {
+func (n *Network) Run() {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
-		n.be.Run()
+		n.be.Run(n.ctx)
 		wg.Done()
 	}()
 
-	<-ctx.Done()
-	n.be.Stop()
+	wg.Add(1)
+	go func() {
+		subnet.LeaseRenewer(n.ctx, n.sm, n.Name, n.lease)
+		wg.Done()
+	}()
 
+	<-n.ctx.Done()
 	wg.Wait()
+}
+
+func (n *Network) Cancel() {
+	n.cancelFunc()
 }

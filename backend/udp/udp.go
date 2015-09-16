@@ -37,52 +37,48 @@ const (
 )
 
 type UdpBackend struct {
-	sm      subnet.Manager
-	network string
-	config  *subnet.Config
-	cfg     struct {
-		Port int
+	sm       subnet.Manager
+	network  string
+	publicIP ip.IP4
+	cfg      struct {
+		 Port int
 	}
-	lease  *subnet.Lease
-	ctl    *os.File
-	ctl2   *os.File
-	tun    *os.File
-	conn   *net.UDPConn
-	mtu    int
-	tunNet ip.IP4Net
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	lease    *subnet.Lease
+	ctl      *os.File
+	ctl2     *os.File
+	tun      *os.File
+	conn     *net.UDPConn
+	mtu      int
+	tunNet   ip.IP4Net
 }
 
-func New(sm subnet.Manager, network string, config *subnet.Config) backend.Backend {
-	ctx, cancel := context.WithCancel(context.Background())
-
+func New(sm subnet.Manager, extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (backend.Backend, error) {
 	be := UdpBackend{
-		sm:      sm,
-		network: network,
-		config:  config,
-		ctx:     ctx,
-		cancel:  cancel,
+		sm:       sm,
+		publicIP: ip.FromIP(extEaddr),
+		// TUN MTU will be smaller b/c of encap (IP+UDP hdrs)
+		mtu:      extIface.MTU - encapOverhead,
 	}
 	be.cfg.Port = defaultPort
-	return &be
+	return &be, nil
 }
 
-func (m *UdpBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (*backend.SubnetDef, error) {
+func (m *UdpBackend) RegisterNetwork(ctx context.Context, network string, config *subnet.Config) (*backend.SubnetDef, error) {
+	m.network = network
+
 	// Parse our configuration
-	if len(m.config.Backend) > 0 {
-		if err := json.Unmarshal(m.config.Backend, &m.cfg); err != nil {
+	if len(config.Backend) > 0 {
+		if err := json.Unmarshal(config.Backend, &m.cfg); err != nil {
 			return nil, fmt.Errorf("error decoding UDP backend config: %v", err)
 		}
 	}
 
 	// Acquire the lease form subnet manager
 	attrs := subnet.LeaseAttrs{
-		PublicIP: ip.FromIP(extEaddr),
+		PublicIP: m.publicIP,
 	}
 
-	l, err := m.sm.AcquireLease(m.ctx, m.network, &attrs)
+	l, err := m.sm.AcquireLease(ctx, m.network, &attrs)
 	switch err {
 	case nil:
 		m.lease = l
@@ -98,11 +94,8 @@ func (m *UdpBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr net
 	// and not that of the individual host (e.g. /24)
 	m.tunNet = ip.IP4Net{
 		IP:        l.Subnet.IP,
-		PrefixLen: m.config.Network.PrefixLen,
+		PrefixLen: config.Network.PrefixLen,
 	}
-
-	// TUN MTU will be smaller b/c of encap (IP+UDP hdrs)
-	m.mtu = extIface.MTU - encapOverhead
 
 	if err = m.initTun(); err != nil {
 		return nil, err
@@ -119,40 +112,43 @@ func (m *UdpBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr net
 	}
 
 	return &backend.SubnetDef{
-		Net: l.Subnet,
-		MTU: m.mtu,
+		Lease: l,
+		MTU:   m.mtu,
 	}, nil
 }
 
-func (m *UdpBackend) Run() {
+func (m *UdpBackend) Run(ctx context.Context) {
 	// one for each goroutine below
-	m.wg.Add(2)
+	wg := sync.WaitGroup{}
 
+	wg.Add(1)
 	go func() {
 		runCProxy(m.tun, m.conn, m.ctl2, m.tunNet.IP, m.mtu)
-		m.wg.Done()
+		wg.Done()
 	}()
 
+	log.Info("Watching for new subnet leases")
+
+	evts := make(chan []subnet.Event)
+
+	wg.Add(1)
 	go func() {
-		subnet.LeaseRenewer(m.ctx, m.sm, m.network, m.lease)
-		m.wg.Done()
+		subnet.WatchLeases(ctx, m.sm, m.network, m.lease, evts)
+		wg.Done()
 	}()
 
-	m.monitorEvents()
+	for {
+		select {
+		case evtBatch := <-evts:
+			m.processSubnetEvents(evtBatch)
 
-	m.wg.Wait()
-}
-
-func (m *UdpBackend) Stop() {
-	if m.ctl != nil {
-		stopProxy(m.ctl)
+		case <-ctx.Done():
+			stopProxy(m.ctl)
+			break
+		}
 	}
 
-	m.cancel()
-}
-
-func (m *UdpBackend) Name() string {
-	return "UDP"
+	wg.Wait()
 }
 
 func newCtlSockets() (*os.File, *os.File, error) {
@@ -216,28 +212,6 @@ func configureIface(ifname string, ipn ip.IP4Net, mtu int) error {
 	}
 
 	return nil
-}
-
-func (m *UdpBackend) monitorEvents() {
-	log.Info("Watching for new subnet leases")
-
-	evts := make(chan []subnet.Event)
-
-	m.wg.Add(1)
-	go func() {
-		subnet.WatchLeases(m.ctx, m.sm, m.network, m.lease, evts)
-		m.wg.Done()
-	}()
-
-	for {
-		select {
-		case evtBatch := <-evts:
-			m.processSubnetEvents(evtBatch)
-
-		case <-m.ctx.Done():
-			return
-		}
-	}
 }
 
 func (m *UdpBackend) processSubnetEvents(batch []subnet.Event) {

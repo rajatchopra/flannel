@@ -41,7 +41,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/coreos/flannel/Godeps/_workspace/src/code.google.com/p/goauth2/compute/serviceaccount"
@@ -60,38 +59,31 @@ var metadataEndpoint = "http://169.254.169.254/computeMetadata/v1"
 var replacer = strings.NewReplacer(".", "-", "/", "-")
 
 type GCEBackend struct {
-	network        string
-	project        string
 	sm             subnet.Manager
-	config         *subnet.Config
+	publicIP       ip.IP4
+	mtu            int
+	project        string
 	lease          *subnet.Lease
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
 	computeService *compute.Service
 	gceNetwork     *compute.Network
 	gceInstance    *compute.Instance
 }
 
-func New(sm subnet.Manager, network string, config *subnet.Config) backend.Backend {
-	ctx, cancel := context.WithCancel(context.Background())
-
+func New(sm subnet.Manager, extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (backend.Backend, error) {
 	gb := GCEBackend{
-		sm:      sm,
-		config:  config,
-		ctx:     ctx,
-		cancel:  cancel,
-		network: network,
+		sm:       sm,
+		publicIP: ip.FromIP(extEaddr),
+		mtu:      extIface.MTU,
 	}
-	return &gb
+	return &gb, nil
 }
 
-func (g *GCEBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (*backend.SubnetDef, error) {
+func (g *GCEBackend) RegisterNetwork(ctx context.Context, network string, config *subnet.Config) (*backend.SubnetDef, error) {
 	attrs := subnet.LeaseAttrs{
-		PublicIP: ip.FromIP(extEaddr),
+		PublicIP: g.publicIP,
 	}
 
-	l, err := g.sm.AcquireLease(g.ctx, g.network, &attrs)
+	l, err := g.sm.AcquireLease(ctx, network, &attrs)
 	switch err {
 	case nil:
 		g.lease = l
@@ -161,23 +153,12 @@ func (g *GCEBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr net
 	}
 
 	return &backend.SubnetDef{
-		Net: l.Subnet,
-		MTU: extIface.MTU,
+		Lease: l,
+		MTU:   g.mtu,
 	}, nil
 }
 
-func (g *GCEBackend) Run() {
-	log.Info("GCE backend running")
-	subnet.LeaseRenewer(g.ctx, g.sm, g.network, g.lease)
-}
-
-func (g *GCEBackend) Stop() {
-	log.Info("GCE backend stopping")
-	g.cancel()
-}
-
-func (g *GCEBackend) Name() string {
-	return "gce"
+func (g *GCEBackend) Run(ctx context.Context) {
 }
 
 func (g *GCEBackend) pollOperationStatus(operationName string) error {

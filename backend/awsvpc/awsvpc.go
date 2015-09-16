@@ -17,57 +17,53 @@ package awsvpc
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+
+	"github.com/coreos/flannel/Godeps/_workspace/src/github.com/aws/aws-sdk-go/aws"
+	"github.com/coreos/flannel/Godeps/_workspace/src/github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/coreos/flannel/Godeps/_workspace/src/github.com/aws/aws-sdk-go/aws/ec2metadata"
+	"github.com/coreos/flannel/Godeps/_workspace/src/github.com/aws/aws-sdk-go/service/ec2"
 	log "github.com/coreos/flannel/Godeps/_workspace/src/github.com/golang/glog"
-	"github.com/coreos/flannel/Godeps/_workspace/src/github.com/mitchellh/goamz/aws"
-	"github.com/coreos/flannel/Godeps/_workspace/src/github.com/mitchellh/goamz/ec2"
 	"github.com/coreos/flannel/Godeps/_workspace/src/golang.org/x/net/context"
+
 	"github.com/coreos/flannel/backend"
 	"github.com/coreos/flannel/pkg/ip"
 	"github.com/coreos/flannel/subnet"
-	"net"
-	"sync"
 )
 
 type AwsVpcBackend struct {
-	sm      subnet.Manager
-	network string
-	config  *subnet.Config
-	cfg     struct {
-		RouteTableID string
+	sm       subnet.Manager
+	publicIP ip.IP4
+	mtu      int
+	cfg      struct {
+		 RouteTableID string
 	}
-	lease  *subnet.Lease
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	lease    *subnet.Lease
 }
 
-func New(sm subnet.Manager, network string, config *subnet.Config) backend.Backend {
-	ctx, cancel := context.WithCancel(context.Background())
-
+func New(sm subnet.Manager, extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (backend.Backend, error) {
 	be := AwsVpcBackend{
 		sm:      sm,
-		network: network,
-		config:  config,
-		ctx:     ctx,
-		cancel:  cancel,
+		publicIP: ip.FromIP(extEaddr),
+		mtu:      extIface.MTU,
 	}
-	return &be
+	return &be, nil
 }
 
-func (m *AwsVpcBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (*backend.SubnetDef, error) {
+func (m *AwsVpcBackend) RegisterNetwork(ctx context.Context, network string, config *subnet.Config) (*backend.SubnetDef, error) {
 	// Parse our configuration
-	if len(m.config.Backend) > 0 {
-		if err := json.Unmarshal(m.config.Backend, &m.cfg); err != nil {
+	if len(config.Backend) > 0 {
+		if err := json.Unmarshal(config.Backend, &m.cfg); err != nil {
 			return nil, fmt.Errorf("error decoding VPC backend config: %v", err)
 		}
 	}
 
 	// Acquire the lease form subnet manager
 	attrs := subnet.LeaseAttrs{
-		PublicIP: ip.FromIP(extEaddr),
+		PublicIP: m.publicIP,
 	}
 
-	l, err := m.sm.AcquireLease(m.ctx, m.network, &attrs)
+	l, err := m.sm.AcquireLease(ctx, network, &attrs)
 	switch err {
 	case nil:
 		m.lease = l
@@ -80,27 +76,17 @@ func (m *AwsVpcBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr 
 	}
 
 	// Figure out this machine's EC2 instance ID and region
-	identity, err := getInstanceIdentity()
+	metadataClient := ec2metadata.New(nil)
+	region, err := metadataClient.Region()
 	if err != nil {
-		return nil, fmt.Errorf("error getting EC2 instance identity: %v", err)
+		return nil, fmt.Errorf("error getting EC2 region name: %v", err)
 	}
-	instanceID, ok := identity["instanceId"].(string)
-	if !ok {
-		return nil, fmt.Errorf("invalid EC2 instance ID: %v", identity["instanceId"])
+	instanceID, err := metadataClient.GetMetadata("instance-id")
+	if err != nil {
+		return nil, fmt.Errorf("error getting EC2 instance ID: %v", err)
 	}
 
-	regionVal, _ := identity["region"].(string)
-	region, ok := aws.Regions[regionVal]
-	if !ok {
-		return nil, fmt.Errorf("invalid AWS region: %v", identity["region"])
-	}
-
-	// Setup the EC2 client
-	auth, err := aws.GetAuth("", "")
-	if err != nil {
-		return nil, fmt.Errorf("error getting AWS credentials from environment: %v", err)
-	}
-	ec2c := ec2.New(auth, region)
+	ec2c := ec2.New(&aws.Config{Region: aws.String(region)})
 
 	if _, err = m.disableSrcDestCheck(instanceID, ec2c); err != nil {
 		log.Infof("Warning- disabling source destination check failed: %v", err)
@@ -119,17 +105,18 @@ func (m *AwsVpcBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr 
 	if err != nil {
 		log.Errorf("Error describing route tables: %v", err)
 
-		if ec2Err, ok := err.(*ec2.Error); ok {
-			if ec2Err.Code == "UnauthorizedOperation" {
+		if ec2Err, ok := err.(awserr.Error); ok {
+			if ec2Err.Code() == "UnauthorizedOperation" {
 				log.Errorf("Note: DescribeRouteTables permission cannot be bound to any resource")
 			}
 		}
-
 	}
 
 	if !matchingRouteFound {
-		if _, err := ec2c.DeleteRoute(m.cfg.RouteTableID, l.Subnet.String()); err != nil {
-			if ec2err, ok := err.(*ec2.Error); !ok || ec2err.Code != "InvalidRoute.NotFound" {
+		cidrBlock := l.Subnet.String()
+		deleteRouteInput := &ec2.DeleteRouteInput{RouteTableId: &m.cfg.RouteTableID, DestinationCidrBlock: &cidrBlock}
+		if _, err := ec2c.DeleteRoute(deleteRouteInput); err != nil {
+			if ec2err, ok := err.(awserr.Error); !ok || ec2err.Code() != "InvalidRoute.NotFound" {
 				// an error other than the route not already existing occurred
 				return nil, fmt.Errorf("error deleting existing route for %s: %v", l.Subnet.String(), err)
 			}
@@ -142,34 +129,35 @@ func (m *AwsVpcBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr 
 	}
 
 	return &backend.SubnetDef{
-		Net: l.Subnet,
-		MTU: extIface.MTU,
+		Lease: l,
+		MTU:   m.mtu,
 	}, nil
 }
 
 func (m *AwsVpcBackend) checkMatchingRoutes(instanceID, subnet string, ec2c *ec2.EC2) (bool, error) {
+	matchingRouteFound := false
 
-	filter := ec2.NewFilter()
+	filter := newFilter()
 	filter.Add("route.destination-cidr-block", subnet)
 	filter.Add("route.state", "active")
 
-	matchingRouteFound := false
+	input := ec2.DescribeRouteTablesInput{Filters: filter, RouteTableIds: []*string{&m.cfg.RouteTableID}}
 
-	resp, err := ec2c.DescribeRouteTables([]string{m.cfg.RouteTableID}, filter)
+	resp, err := ec2c.DescribeRouteTables(&input)
 	if err != nil {
 		return matchingRouteFound, err
 	}
 
 	for _, routeTable := range resp.RouteTables {
 		for _, route := range routeTable.Routes {
-			if subnet == route.DestinationCidrBlock && route.State == "active" {
+			if subnet == *route.DestinationCidrBlock && *route.State == "active" {
 
-				if route.InstanceId == instanceID {
+				if *route.InstanceId == instanceID {
 					matchingRouteFound = true
 					break
 				}
 
-				log.Errorf("Deleting invalid *active* matching route: %s, %s \n", route.DestinationCidrBlock, route.InstanceId)
+				log.Errorf("Deleting invalid *active* matching route: %s, %s \n", *route.DestinationCidrBlock, *route.InstanceId)
 			}
 		}
 	}
@@ -177,26 +165,30 @@ func (m *AwsVpcBackend) checkMatchingRoutes(instanceID, subnet string, ec2c *ec2
 	return matchingRouteFound, nil
 }
 
-func (m *AwsVpcBackend) createRoute(instanceID, subnet string, ec2c *ec2.EC2) (*ec2.SimpleResp, error) {
-	route := &ec2.CreateRoute{
-		RouteTableId:         m.cfg.RouteTableID,
-		InstanceId:           instanceID,
-		DestinationCidrBlock: subnet,
+func (m *AwsVpcBackend) createRoute(instanceID, subnet string, ec2c *ec2.EC2) (*ec2.CreateRouteOutput, error) {
+	route := &ec2.CreateRouteInput{
+		RouteTableId:         &m.cfg.RouteTableID,
+		InstanceId:           &instanceID,
+		DestinationCidrBlock: &subnet,
 	}
 
 	return ec2c.CreateRoute(route)
 }
-func (m *AwsVpcBackend) disableSrcDestCheck(instanceID string, ec2c *ec2.EC2) (*ec2.ModifyInstanceResp, error) {
-	modifyAttributes := &ec2.ModifyInstance{
-		SourceDestCheck:    false,
-		SetSourceDestCheck: true,
+func (m *AwsVpcBackend) disableSrcDestCheck(instanceID string, ec2c *ec2.EC2) (*ec2.ModifyInstanceAttributeOutput, error) {
+	modifyAttributes := &ec2.ModifyInstanceAttributeInput{
+		InstanceId:      aws.String(instanceID),
+		SourceDestCheck: &ec2.AttributeBooleanValue{Value: aws.Bool(false)},
 	}
 
-	return ec2c.ModifyInstance(instanceID, modifyAttributes)
+	return ec2c.ModifyInstanceAttribute(modifyAttributes)
 }
 
 func (m *AwsVpcBackend) detectRouteTableID(instanceID string, ec2c *ec2.EC2) error {
-	resp, err := ec2c.Instances([]string{instanceID}, nil)
+	instancesInput := &ec2.DescribeInstancesInput{
+		InstanceIds: []*string{&instanceID},
+	}
+
+	resp, err := ec2c.DescribeInstances(instancesInput)
 	if err != nil {
 		return fmt.Errorf("error getting instance info: %v", err)
 	}
@@ -212,27 +204,35 @@ func (m *AwsVpcBackend) detectRouteTableID(instanceID string, ec2c *ec2.EC2) err
 	subnetID := resp.Reservations[0].Instances[0].SubnetId
 	vpcID := resp.Reservations[0].Instances[0].VpcId
 
-	log.Info("Subnet-ID: ", subnetID)
-	log.Info("VPC-ID: ", vpcID)
+	log.Info("Subnet-ID: ", *subnetID)
+	log.Info("VPC-ID: ", *vpcID)
 
-	filter := ec2.NewFilter()
-	filter.Add("association.subnet-id", subnetID)
+	filter := newFilter()
+	filter.Add("association.subnet-id", *subnetID)
 
-	res, err := ec2c.DescribeRouteTables(nil, filter)
+	routeTablesInput := &ec2.DescribeRouteTablesInput{
+		Filters: filter,
+	}
+
+	res, err := ec2c.DescribeRouteTables(routeTablesInput)
 	if err != nil {
-		return fmt.Errorf("error describing routeTables for subnetID %s: %v", subnetID, err)
+		return fmt.Errorf("error describing routeTables for subnetID %s: %v", *subnetID, err)
 	}
 
 	if len(res.RouteTables) != 0 {
-		m.cfg.RouteTableID = res.RouteTables[0].RouteTableId
+		m.cfg.RouteTableID = *res.RouteTables[0].RouteTableId
 		return nil
 	}
 
-	filter = ec2.NewFilter()
+	filter = newFilter()
 	filter.Add("association.main", "true")
-	filter.Add("vpc-id", vpcID)
+	filter.Add("vpc-id", *vpcID)
 
-	res, err = ec2c.DescribeRouteTables(nil, filter)
+	routeTablesInput = &ec2.DescribeRouteTablesInput{
+		Filters: filter,
+	}
+
+	res, err = ec2c.DescribeRouteTables(routeTablesInput)
 	if err != nil {
 		log.Info("error describing route tables: ", err)
 	}
@@ -241,18 +241,10 @@ func (m *AwsVpcBackend) detectRouteTableID(instanceID string, ec2c *ec2.EC2) err
 		return fmt.Errorf("main route table not found")
 	}
 
-	m.cfg.RouteTableID = res.RouteTables[0].RouteTableId
+	m.cfg.RouteTableID = *res.RouteTables[0].RouteTableId
 
 	return nil
 }
-func (m *AwsVpcBackend) Run() {
-	subnet.LeaseRenewer(m.ctx, m.sm, m.network, m.lease)
-}
 
-func (m *AwsVpcBackend) Stop() {
-	m.cancel()
-}
-
-func (m *AwsVpcBackend) Name() string {
-	return "aws-vpc"
+func (m *AwsVpcBackend) Run(ctx context.Context) {
 }

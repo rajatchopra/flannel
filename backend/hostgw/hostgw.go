@@ -35,42 +35,39 @@ const (
 
 type HostgwBackend struct {
 	sm       subnet.Manager
+	publicIP ip.IP4
 	network  string
 	lease    *subnet.Lease
 	extIface *net.Interface
 	extIaddr net.IP
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	mtu      int
 	rl       []netlink.Route
 }
 
-func New(sm subnet.Manager, network string) backend.Backend {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	b := &HostgwBackend{
-		sm:      sm,
-		network: network,
-		ctx:     ctx,
-		cancel:  cancel,
-	}
-	return b
-}
-
-func (rb *HostgwBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (*backend.SubnetDef, error) {
-	rb.extIface = extIface
-	rb.extIaddr = extIaddr
-
+func New(sm subnet.Manager, extIface *net.Interface, extIaddr net.IP, extEaddr net.IP) (backend.Backend, error) {
 	if !extIaddr.Equal(extEaddr) {
 		return nil, fmt.Errorf("your PublicIP differs from interface IP, meaning that probably you're on a NAT, which is not supported by host-gw backend")
 	}
 
+	b := &HostgwBackend{
+		sm:       sm,
+		publicIP: ip.FromIP(extEaddr),
+		mtu:      extIface.MTU,
+		extIface: extIface,
+		extIaddr: extIaddr,
+	}
+	return b, nil
+}
+
+func (rb *HostgwBackend) RegisterNetwork(ctx context.Context, network string, config *subnet.Config) (*backend.SubnetDef, error) {
+	rb.network = network
+
 	attrs := subnet.LeaseAttrs{
-		PublicIP:    ip.FromIP(extIaddr),
+		PublicIP:    rb.publicIP,
 		BackendType: "host-gw",
 	}
 
-	l, err := rb.sm.AcquireLease(rb.ctx, rb.network, &attrs)
+	l, err := rb.sm.AcquireLease(ctx, rb.network, &attrs)
 	switch err {
 	case nil:
 		rb.lease = l
@@ -85,52 +82,40 @@ func (rb *HostgwBackend) Init(extIface *net.Interface, extIaddr net.IP, extEaddr
 	/* NB: docker will create the local route to `sn` */
 
 	return &backend.SubnetDef{
-		Net: l.Subnet,
-		MTU: extIface.MTU,
+		Lease: l,
+		MTU:   rb.mtu,
 	}, nil
 }
 
-func (rb *HostgwBackend) Run() {
-	rb.wg.Add(1)
-	go func() {
-		subnet.LeaseRenewer(rb.ctx, rb.sm, rb.network, rb.lease)
-		rb.wg.Done()
-	}()
+func (rb *HostgwBackend) Run(ctx context.Context) {
+	wg := sync.WaitGroup{}
 
 	log.Info("Watching for new subnet leases")
 	evts := make(chan []subnet.Event)
-	rb.wg.Add(1)
+	wg.Add(1)
 	go func() {
-		subnet.WatchLeases(rb.ctx, rb.sm, rb.network, rb.lease, evts)
-		rb.wg.Done()
+		subnet.WatchLeases(ctx, rb.sm, rb.network, rb.lease, evts)
+		wg.Done()
 	}()
 
 	rb.rl = make([]netlink.Route, 0, 10)
-	rb.wg.Add(1)
+	wg.Add(1)
 	go func() {
-		rb.routeCheck(rb.ctx)
-		rb.wg.Done()
+		rb.routeCheck(ctx)
+		wg.Done()
 	}()
 
-	defer rb.wg.Wait()
+	defer wg.Wait()
 
 	for {
 		select {
 		case evtBatch := <-evts:
 			rb.handleSubnetEvents(evtBatch)
 
-		case <-rb.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}
-}
-
-func (rb *HostgwBackend) Stop() {
-	rb.cancel()
-}
-
-func (rb *HostgwBackend) Name() string {
-	return "host-gw"
 }
 
 func (rb *HostgwBackend) handleSubnetEvents(batch []subnet.Event) {
