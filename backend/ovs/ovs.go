@@ -209,7 +209,7 @@ func (ovsb *OVSBackend) handleSubnetEvents(network *OVSNetwork, batch []subnet.E
 	for _, evt := range batch {
 		switch evt.Type {
 		case subnet.EventAdded:
-			log.Info("Subnet added: ", evt.Lease.Subnet)
+			log.Infof("Subnet added: %s => %s", evt.Lease.Attrs.PublicIP, evt.Lease.Subnet)
 
 			if evt.Lease.Attrs.BackendType != "ovs" {
 				log.Warningf("Ignoring non-ovs subnet: type=%v", evt.Lease.Attrs.BackendType)
@@ -224,7 +224,7 @@ func (ovsb *OVSBackend) handleSubnetEvents(network *OVSNetwork, batch []subnet.E
 			}
 
 		case subnet.EventRemoved:
-			log.Info("Subnet removed: ", evt.Lease.Subnet)
+			log.Infof("Subnet removed: %s => %s", evt.Lease.Attrs.PublicIP, evt.Lease.Subnet)
 
 			if evt.Lease.Attrs.BackendType != "ovs" {
 				log.Warningf("Ignoring non-ovs subnet: type=%v", evt.Lease.Attrs.BackendType)
